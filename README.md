@@ -74,7 +74,23 @@ upgrade path, and no function that can move funds other than `pay`.
 Foundry unit, fuzz, and invariant tests (`forge test`). Invariants include:
 spending in any period never exceeds the period cap, no single payment exceeds
 the per-payment cap, payments only reach allowlisted recipients, and a revoked
-grant never pays again.
+grant never pays again. The invariant handler checks spending against its own
+record of each cap, not against values read back from the contract.
+
+The invariants were checked against deliberately broken copies of the contract.
+Each break below turned its invariant red on five fuzz seeds, while the unchanged
+contract stayed green:
+
+- no period-cap check, `setCaps` resetting the spend, a window that never rolls
+  over, a window that rolls over on every payment: `invariant_I3` fails
+- no agent check: `invariant_I2` fails
+- no allowlist check: `invariant_I1` fails
+
+`forge lint` flags four narrowing casts in `src/SpendGate.sol`. All are safe:
+`uint64(block.timestamp)` and `uint64(idx)` (the index is at most the timestamp),
+`uint128(newSpent)` (checked against the `uint128` period cap just before), and
+`uint128(m)` (at most `remaining`, a `uint128`). No lint-disable comments were
+added, so the source stays byte-identical to the verified deployment.
 
 ## Build
 

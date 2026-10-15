@@ -865,12 +865,20 @@ contract Handler is Test {
     uint256 public ghostGrants;
     uint256 public ghostPaySuccess;
     uint256 public ghostPayRevert;
+    // Same counters, but only for calls driven by the fuzzer (the `_boot` seed is excluded),
+    // so the non-vacuity check cannot be satisfied by pre-seeded data alone.
+    uint256 public fuzzPaySuccess;
+    uint256 public fuzzPayRevert;
     bool public bootstrapped;
+    bool private _booting;
 
     bool[10] public violation;
 
     mapping(uint256 => Rec) public rec;
     mapping(address => int256) public ledger;
+    // The handler's own record of each grant's current period cap. I3 is checked against
+    // this, never against the cap read back from the contract under test.
+    mapping(uint256 => uint256) public capNow;
     mapping(uint256 => mapping(uint256 => uint256)) public maxCap;
     mapping(uint256 => mapping(uint256 => uint256)) public paid;
     mapping(uint256 => mapping(uint256 => bool)) private _isTouched;
@@ -899,7 +907,7 @@ contract Handler is Test {
     function actCreateGrant(uint256 seed, uint256 period, uint256 cap, uint256 ppc, uint256 expSeed) external {
         _boot();
         cap = bound(cap, 1, 1e12);
-        ppc = bound(ppc, 1, cap);
+        ppc = _boundPpc(ppc, cap);
         period = bound(period, 1, 30 days);
         uint256 expiry = expSeed % 10 < 3 ? block.timestamp + bound(expSeed / 10, 1, 60 days) : 0;
         _create(owners[seed % 2], agents[(seed / 2) % 3], period, cap, ppc, expiry, _pickRecipients(seed / 6));
@@ -920,14 +928,16 @@ contract Handler is Test {
         uint256 id = 1 + idSeed % ghostGrants;
         address caller = _ownerOrStranger(id, callerSeed);
         cap = bound(cap, 1, 1e12);
-        ppc = bound(ppc, 1, cap);
+        ppc = _boundPpc(ppc, cap);
 
-        ISpendGate.Grant memory g = gate.grants(id);
-        _noteCap(id, (block.timestamp - g.start) / g.period, g.periodCap);
+        uint256 idx = _idx(id);
+        _noteCap(id, idx, capNow[id]);
 
         vm.prank(caller);
         try gate.setCaps(id, uint128(cap), uint128(ppc)) {
             _checkOwnerAction(id, caller);
+            capNow[id] = cap;
+            _noteCap(id, idx, cap);
         } catch {}
     }
 
@@ -937,8 +947,22 @@ contract Handler is Test {
         ISpendGate.Grant memory g = gate.grants(id);
         uint256 pick = callerSeed % 10;
         address caller = pick < 8 ? g.agent : (pick == 8 ? g.owner : stranger);
-        amount = bound(amount, 0, uint256(g.perPaymentCap) * 5 / 4 + 1);
-        _doPay(id, caller, recipients[toSeed % 4], amount, memo);
+        // A third of the time pay exactly the per-payment cap, so a handful of payments reach
+        // the period cap; otherwise anything from zero to a little over the per-payment cap.
+        amount = amount % 3 == 0 ? g.perPaymentCap : bound(amount, 0, uint256(g.perPaymentCap) * 5 / 4 + 1);
+        // Three times in four, aim at a recipient the grant currently allows, so successful
+        // payments are common enough to exercise the window accounting; otherwise any recipient.
+        address to = recipients[toSeed % 4];
+        if ((toSeed / 4) % 4 != 0) {
+            for (uint256 j = 0; j < 4; ++j) {
+                address r = recipients[(toSeed + j) % 4];
+                if (gate.isRecipient(id, r)) {
+                    to = r;
+                    break;
+                }
+            }
+        }
+        _doPay(id, caller, to, amount, memo);
     }
 
     function actRevoke(uint256 idSeed, uint256 callerSeed) external {
@@ -979,11 +1003,24 @@ contract Handler is Test {
     function _boot() internal {
         if (bootstrapped) return;
         bootstrapped = true;
+        _booting = true;
         address[] memory rs = new address[](1);
         rs[0] = recipients[0];
         uint256 id = _create(owners[0], agents[0], 30 days, 1e12, 1e9, 0, rs);
         _doPay(id, agents[0], recipients[0], 1000, bytes32(0));
         _doPay(id, stranger, recipients[0], 1000, bytes32(0));
+        _booting = false;
+    }
+
+    /// Half the time the per-payment cap is at least a quarter of the period cap, so a few
+    /// payments can reach the period cap and the period-cap check is actually exercised.
+    function _boundPpc(uint256 ppc, uint256 cap) internal pure returns (uint256) {
+        if (ppc % 2 == 0) return bound(ppc, 1, cap);
+        return bound(ppc, cap / 4 == 0 ? 1 : cap / 4, cap);
+    }
+
+    function _idx(uint256 id) internal view returns (uint256) {
+        return (block.timestamp - rec[id].start) / rec[id].period;
     }
 
     function _flag(uint256 k) internal {
@@ -1019,6 +1056,8 @@ contract Handler is Test {
             ghostGrants++;
             if (id != ghostGrants) _flag(9);
             rec[id] = Rec(owner_, agent, uint64(period), uint64(block.timestamp), false);
+            capNow[id] = cap;
+            _noteCap(id, 0, cap);
             return id;
         } catch {
             return 0;
@@ -1043,20 +1082,21 @@ contract Handler is Test {
         Pre memory p;
         p.g = gate.grants(id);
         p.wasRecipient = gate.isRecipient(id, to);
-        p.idx = (block.timestamp - p.g.start) / p.g.period;
-        _noteCap(id, p.idx, p.g.periodCap);
+        p.idx = _idx(id);
+        _noteCap(id, p.idx, capNow[id]);
 
         vm.prank(caller);
         try gate.pay(id, to, uint128(amount), memo) {
             _onPaySuccess(id, caller, to, amount, p);
-        } catch {
-            _onPayRevert(id, p);
+        } catch (bytes memory reason) {
+            _onPayRevert(id, amount, reason, p);
         }
     }
 
     function _onPaySuccess(uint256 id, address caller, address to, uint256 amount, Pre memory p) internal {
         ISpendGate.Grant memory g = p.g;
         ghostPaySuccess++;
+        if (!_booting) fuzzPaySuccess++;
 
         if (!p.wasRecipient) _flag(1);
         if (caller != g.agent) _flag(2);
@@ -1064,18 +1104,30 @@ contract Handler is Test {
         if (g.revoked || rec[id].revoked) _flag(5);
         if (g.expiresAt != 0 && block.timestamp >= g.expiresAt) _flag(6);
 
-        uint256 prior = p.idx == g.windowIndex ? g.spentInWindow : 0;
-        if (prior + amount > g.periodCap) _flag(3);
+        // I3 against the handler's own model: what this window already paid plus this
+        // payment must fit the cap the handler last set.
+        if (paid[id][p.idx] + amount > capNow[id]) _flag(3);
 
         paid[id][p.idx] += amount;
+        // Window bookkeeping must match the model: the window index is the current one and
+        // the stored spend is exactly what was paid in it (catches "never rolls" and
+        // "rolls on every payment").
+        ISpendGate.Grant memory after_ = gate.grants(id);
+        if (after_.windowIndex != p.idx || after_.spentInWindow != paid[id][p.idx]) _flag(3);
         ledger[g.owner] -= int256(amount);
         ledger[to] += int256(amount);
     }
 
-    function _onPayRevert(uint256 id, Pre memory p) internal {
+    function _onPayRevert(uint256 id, uint256 amount, bytes memory reason, Pre memory p) internal {
         ghostPayRevert++;
+        if (!_booting) fuzzPayRevert++;
         ISpendGate.Grant memory after_ = gate.grants(id);
         if (after_.windowIndex != p.g.windowIndex || after_.spentInWindow != p.g.spentInWindow) _flag(8);
+        // The other side of I3: a payment rejected as over the period cap must really be over
+        // it by the handler's own model (catches a window that never rolls over).
+        if (bytes4(reason) == ISpendGate.OverPeriodCap.selector && paid[id][p.idx] + amount <= capNow[id]) {
+            _flag(3);
+        }
     }
 }
 
@@ -1102,8 +1154,13 @@ contract SpendGateInvariantTest is StdInvariant, Test {
         targetSelector(FuzzSelector({addr: address(h), selectors: sels}));
     }
 
-    // Non-vacuity: every run must have exercised grants, a payment success, a payment
-    // revert, and at least one tracked window.
+    // Plumbing check: every run has grants, a payment success, a payment revert, and at least
+    // one tracked window. These counts include the `_boot` seed, so they show the handler and
+    // its bookkeeping work; they do not show that the fuzzer itself reached a successful
+    // payment in every run (it does not always: a 32-call run can contain no successful pay).
+    // Evidence that the invariants actually bite comes from the mutation arms recorded in
+    // HANDOFF.md: each of DESIGN section 7 item 11's five broken implementations turns its
+    // invariant red.
     function afterInvariant() public view {
         assertGt(h.ghostGrants(), 0, "no grants created");
         assertGt(h.ghostPaySuccess(), 0, "no successful pay");
@@ -1126,6 +1183,8 @@ contract SpendGateInvariantTest is StdInvariant, Test {
         assertGt(h.ghostPaySuccess(), 0);
         assertGt(h.ghostPayRevert(), 0);
         assertGt(h.touchedLength(), 0);
+        assertGt(h.fuzzPaySuccess(), 0, "no non-boot successful pay");
+        assertGt(h.fuzzPayRevert(), 0, "no non-boot reverted pay");
         for (uint256 k = 1; k < 10; ++k) {
             assertFalse(h.violation(k), "violation flag set");
         }
